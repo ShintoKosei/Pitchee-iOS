@@ -30,7 +30,10 @@ concurrency:
 jobs:
   ipa:
     name: Build ${{ github.event.inputs.configuration || 'Release' }} IPA
-    runs-on: macos-26
+    # The sources use SwiftUI APIs that ship with the iOS 27 SDK
+    # (ArrangementView, reorderable containers), so the Xcode 27 image is
+    # required; the macOS 26 image only goes up to the iOS 26.5 SDK.
+    runs-on: xcode-27
     timeout-minutes: 120
     env:
       CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
@@ -43,27 +46,46 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Select the newest installed Xcode
+      - name: Select an Xcode with a new enough iOS SDK
         run: |
           set -euo pipefail
-          echo "Runner default: $(xcodebuild -version | head -n 1)"
-          best_app=''
-          best_sdk='0'
-          for app in /Applications/Xcode*.app; do
-            [ -d "$app" ] || continue
-            sdk=$(DEVELOPER_DIR="$app/Contents/Developer" xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true)
-            [ -n "$sdk" ] || continue
-            newest=$(printf '%s\n%s\n' "$best_sdk" "$sdk" | sort -V | tail -n 1)
-            if [ "$newest" = "$sdk" ]; then
-              best_app="$app"
-              best_sdk="$sdk"
-            fi
-          done
-          if [ -n "$best_app" ]; then
-            echo "DEVELOPER_DIR=$best_app/Contents/Developer" >> "$GITHUB_ENV"
-            echo "Selected $best_app with iOS SDK $best_sdk"
+          required=$(grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9]+\.[0-9]+' Pitchee.xcodeproj/project.pbxproj \
+            | grep -oE '[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+          echo "Project deployment target: ${required:-unknown}"
+          default_dev=$(xcode-select -p)
+          default_sdk=$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo 0)
+          echo "Default Xcode: $default_dev (iOS SDK $default_sdk)"
+          chosen="$default_dev"
+          chosen_sdk="$default_sdk"
+          if [ -n "$required" ] && [ "$required" != "$default_sdk" ] \
+            && [ "$(printf '%s\n%s\n' "$required" "$default_sdk" | sort -V | tail -n 1)" = "$required" ]; then
+            chosen=''
+            chosen_sdk=''
+            for app in /Applications/Xcode*.app; do
+              [ -d "$app" ] || continue
+              sdk=$(DEVELOPER_DIR="$app/Contents/Developer" xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true)
+              [ -n "$sdk" ] || continue
+              if [ -z "$chosen_sdk" ] || [ "$(printf '%s\n%s\n' "$chosen_sdk" "$sdk" | sort -V | tail -n 1)" = "$sdk" ]; then
+                chosen="$app/Contents/Developer"
+                chosen_sdk="$sdk"
+              fi
+            done
           fi
-          echo "IOS_SDK=$best_sdk" >> "$GITHUB_ENV"
+          if [ -z "$chosen" ] || [ -z "$chosen_sdk" ]; then
+            echo '::error::No installed Xcode provides a usable iOS SDK.'
+            exit 1
+          fi
+          if [ -n "$required" ] && [ "$required" != "$chosen_sdk" ] \
+            && [ "$(printf '%s\n%s\n' "$required" "$chosen_sdk" | sort -V | tail -n 1)" = "$required" ]; then
+            echo "::error::Best available iOS SDK is $chosen_sdk but the project needs $required."
+            exit 1
+          fi
+          echo "Selected $chosen with iOS SDK $chosen_sdk"
+          {
+            echo "DEVELOPER_DIR=$chosen"
+            echo "IOS_SDK=$chosen_sdk"
+            echo "DEPLOY_TARGET=$required"
+          } >> "$GITHUB_ENV"
 
       - name: Bootstrap native dependencies
         run: sh Scripts/bootstrap-native-dependencies.sh
@@ -74,25 +96,18 @@ jobs:
           # The app target inherits $(RECOMMENDED_IPHONEOS_DEPLOYMENT_TARGET),
           # which resolves to the SDK minimum outside of Xcode Cloud. Pin the
           # deployment target the project declares at the project level.
-          required=$(grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9]+\.[0-9]+' Pitchee.xcodeproj/project.pbxproj \
-            | grep -oE '[0-9]+\.[0-9]+' | sort -V | tail -n 1)
-          deploy_target=$required
-          if [ -n "$required" ] && [ "$required" != "$IOS_SDK" ] \
-            && [ "$(printf '%s\n%s\n' "$required" "$IOS_SDK" | sort -V | tail -n 1)" = "$required" ]; then
-            echo "::warning::iOS SDK $IOS_SDK is older than the project deployment target $required; building against $IOS_SDK."
-            deploy_target=$IOS_SDK
-          fi
           args="-project Pitchee.xcodeproj -scheme $SCHEME -configuration $CONFIGURATION -sdk iphoneos"
           args="$args -destination generic/platform=iOS -derivedDataPath build/DerivedData"
           args="$args CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="
           args="$args CODE_SIGN_ENTITLEMENTS= ENABLE_BITCODE=NO"
-          if [ -n "$deploy_target" ]; then
-            args="$args IPHONEOS_DEPLOYMENT_TARGET=$deploy_target"
+          if [ -n "${DEPLOY_TARGET:-}" ]; then
+            args="$args IPHONEOS_DEPLOYMENT_TARGET=$DEPLOY_TARGET"
           fi
           # shellcheck disable=SC2086
           if ! xcodebuild $args > build.log 2>&1; then
             echo '::error::xcodebuild failed'
-            tail -n 300 build.log
+            grep -E 'error:|BUILD FAILED' build.log | head -n 60
+            tail -n 200 build.log
             exit 1
           fi
           tail -n 5 build.log
