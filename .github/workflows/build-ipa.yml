@@ -71,20 +71,23 @@ jobs:
       - name: Build the app without code signing
         run: |
           set -euo pipefail
+          # The app target inherits $(RECOMMENDED_IPHONEOS_DEPLOYMENT_TARGET),
+          # which resolves to the SDK minimum outside of Xcode Cloud. Pin the
+          # deployment target the project declares at the project level.
           required=$(grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9]+\.[0-9]+' Pitchee.xcodeproj/project.pbxproj \
             | grep -oE '[0-9]+\.[0-9]+' | sort -V | tail -n 1)
-          clamp=0
+          deploy_target=$required
           if [ -n "$required" ] && [ "$required" != "$IOS_SDK" ] \
             && [ "$(printf '%s\n%s\n' "$required" "$IOS_SDK" | sort -V | tail -n 1)" = "$required" ]; then
-            echo "::warning::iOS SDK $IOS_SDK is older than the project deployment target $required; clamping."
-            clamp=1
+            echo "::warning::iOS SDK $IOS_SDK is older than the project deployment target $required; building against $IOS_SDK."
+            deploy_target=$IOS_SDK
           fi
           args="-project Pitchee.xcodeproj -scheme $SCHEME -configuration $CONFIGURATION -sdk iphoneos"
           args="$args -destination generic/platform=iOS -derivedDataPath build/DerivedData"
           args="$args CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="
           args="$args CODE_SIGN_ENTITLEMENTS= ENABLE_BITCODE=NO"
-          if [ "$clamp" = "1" ]; then
-            args="$args IPHONEOS_DEPLOYMENT_TARGET=$IOS_SDK"
+          if [ -n "$deploy_target" ]; then
+            args="$args IPHONEOS_DEPLOYMENT_TARGET=$deploy_target"
           fi
           # shellcheck disable=SC2086
           if ! xcodebuild $args > build.log 2>&1; then
