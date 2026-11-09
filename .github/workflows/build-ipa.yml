@@ -1,0 +1,132 @@
+name: Build unsigned IPA
+
+# Produces an unsigned device .ipa for sideloading (AltStore / Sideloadly /
+# Xcode) and publishes it as a release asset, so the file can be downloaded
+# without an authenticated Actions artifact request.
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-ipa.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: Build ${{ github.event.inputs.configuration || 'Release' }} IPA
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
+      SCHEME: Pitchee
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Select the newest installed Xcode
+        run: |
+          set -euo pipefail
+          echo "Runner default: $(xcodebuild -version | head -n 1)"
+          best_app=''
+          best_sdk='0'
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            sdk=$(DEVELOPER_DIR="$app/Contents/Developer" xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true)
+            [ -n "$sdk" ] || continue
+            newest=$(printf '%s\n%s\n' "$best_sdk" "$sdk" | sort -V | tail -n 1)
+            if [ "$newest" = "$sdk" ]; then
+              best_app="$app"
+              best_sdk="$sdk"
+            fi
+          done
+          if [ -n "$best_app" ]; then
+            echo "DEVELOPER_DIR=$best_app/Contents/Developer" >> "$GITHUB_ENV"
+            echo "Selected $best_app with iOS SDK $best_sdk"
+          fi
+          echo "IOS_SDK=$best_sdk" >> "$GITHUB_ENV"
+
+      - name: Bootstrap native dependencies
+        run: sh Scripts/bootstrap-native-dependencies.sh
+
+      - name: Build the app without code signing
+        run: |
+          set -euo pipefail
+          required=$(grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9]+\.[0-9]+' Pitchee.xcodeproj/project.pbxproj \
+            | grep -oE '[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+          clamp=0
+          if [ -n "$required" ] && [ "$required" != "$IOS_SDK" ] \
+            && [ "$(printf '%s\n%s\n' "$required" "$IOS_SDK" | sort -V | tail -n 1)" = "$required" ]; then
+            echo "::warning::iOS SDK $IOS_SDK is older than the project deployment target $required; clamping."
+            clamp=1
+          fi
+          args="-project Pitchee.xcodeproj -scheme $SCHEME -configuration $CONFIGURATION -sdk iphoneos"
+          args="$args -destination generic/platform=iOS -derivedDataPath build/DerivedData"
+          args="$args CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="
+          args="$args CODE_SIGN_ENTITLEMENTS= ENABLE_BITCODE=NO"
+          if [ "$clamp" = "1" ]; then
+            args="$args IPHONEOS_DEPLOYMENT_TARGET=$IOS_SDK"
+          fi
+          # shellcheck disable=SC2086
+          if ! xcodebuild $args > build.log 2>&1; then
+            echo '::error::xcodebuild failed'
+            tail -n 300 build.log
+            exit 1
+          fi
+          tail -n 5 build.log
+
+      - name: Package the unsigned IPA
+        run: |
+          set -euo pipefail
+          version=$(awk -F'= ' '/^MARKETING_VERSION/ {print $2; exit}' Config/Version.xcconfig | tr -d ' ')
+          app="build/DerivedData/Build/Products/${CONFIGURATION}-iphoneos/Pitchee.app"
+          if [ ! -d "$app" ]; then
+            echo "::error::Expected app bundle at $app"
+            exit 1
+          fi
+          rm -rf build/Payload dist
+          mkdir -p build/Payload dist
+          cp -R "$app" build/Payload/Pitchee.app
+          rm -rf build/Payload/Pitchee.app/_CodeSignature
+          ( cd build && zip -qry "../dist/Pitchee-${version}-${CONFIGURATION}-unsigned.ipa" Payload )
+          ls -lh dist
+          {
+            echo "VERSION=$version"
+            echo "IPA_NAME=Pitchee-${version}-${CONFIGURATION}-unsigned.ipa"
+          } >> "$GITHUB_ENV"
+
+      - name: Publish the IPA as a release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="ipa-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" "dist/$IPA_NAME" \
+            --title "Pitchee ${VERSION} (${CONFIGURATION}) unsigned IPA" \
+            --notes "Unsigned device build from commit ${GITHUB_SHA}. Re-sign with your own certificate before installing (AltStore, Sideloadly, or Xcode)."
+          {
+            echo '### Unsigned IPA'
+            echo ''
+            echo "- File: \`$IPA_NAME\`"
+            echo "- Download: https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag/$IPA_NAME"
+            echo '- Install: re-sign with your own Apple ID (AltStore / Sideloadly) or through Xcode.'
+          } >> "$GITHUB_STEP_SUMMARY"
