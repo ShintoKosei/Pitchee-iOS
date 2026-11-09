@@ -3,6 +3,11 @@ name: Build unsigned IPA
 # Produces an unsigned device .ipa for sideloading (AltStore / Sideloadly /
 # Xcode) and publishes it as a release asset, so the file can be downloaded
 # without an authenticated Actions artifact request.
+#
+# The project declares IPHONEOS_DEPLOYMENT_TARGET = 26.5, but every iOS 26/27
+# API in the sources is already wrapped in #available with a pre-26 fallback.
+# We therefore override the deployment target at build time so the resulting
+# binary can run on older devices, instead of inheriting the project's 26.5.
 
 on:
   workflow_dispatch:
@@ -15,6 +20,11 @@ on:
         options:
           - Release
           - Debug
+      deployment_target:
+        description: Minimum iOS version the IPA should support
+        required: true
+        default: "17.0"
+        type: string
   push:
     branches: [main]
     paths:
@@ -29,7 +39,7 @@ concurrency:
 
 jobs:
   ipa:
-    name: Build ${{ github.event.inputs.configuration || 'Release' }} IPA
+    name: Build ${{ github.event.inputs.configuration || 'Release' }} IPA (iOS ${{ github.event.inputs.deployment_target || '17.0' }}+)
     # The sources use SwiftUI APIs that ship with the iOS 27 SDK
     # (ArrangementView, reorderable containers), so the Xcode 27 image is
     # required; the macOS 26 image only goes up to the iOS 26.5 SDK.
@@ -38,6 +48,7 @@ jobs:
     env:
       CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
       SCHEME: Pitchee
+      DEPLOY_TARGET: ${{ github.event.inputs.deployment_target || '17.0' }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,19 +57,23 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Select an Xcode with a new enough iOS SDK
+      - name: Select an Xcode whose iOS SDK covers the newest #available
         run: |
           set -euo pipefail
-          required=$(grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9]+\.[0-9]+' Pitchee.xcodeproj/project.pbxproj \
-            | grep -oE '[0-9]+\.[0-9]+' | sort -V | tail -n 1)
-          echo "Project deployment target: ${required:-unknown}"
+          # The SDK must be at least as new as the newest #available(iOS x)
+          # in the sources, otherwise the newer SwiftUI symbols do not exist.
+          needed_major=$(grep -rhoE '#available\(iOS [0-9]+' PitcheeApp \
+            | grep -oE '[0-9]+$' | sort -n | tail -n 1)
+          echo "Newest #available(iOS N) in sources: ${needed_major:-unknown}"
+          echo "Requested minimum iOS version: $DEPLOY_TARGET"
+
           default_dev=$(xcode-select -p)
           default_sdk=$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo 0)
           echo "Default Xcode: $default_dev (iOS SDK $default_sdk)"
+
           chosen="$default_dev"
           chosen_sdk="$default_sdk"
-          if [ -n "$required" ] && [ "$required" != "$default_sdk" ] \
-            && [ "$(printf '%s\n%s\n' "$required" "$default_sdk" | sort -V | tail -n 1)" = "$required" ]; then
+          if [ -n "$needed_major" ] && [ "${default_sdk%%.*}" -lt "$needed_major" ]; then
             chosen=''
             chosen_sdk=''
             for app in /Applications/Xcode*.app; do
@@ -71,20 +86,19 @@ jobs:
               fi
             done
           fi
+
           if [ -z "$chosen" ] || [ -z "$chosen_sdk" ]; then
             echo '::error::No installed Xcode provides a usable iOS SDK.'
             exit 1
           fi
-          if [ -n "$required" ] && [ "$required" != "$chosen_sdk" ] \
-            && [ "$(printf '%s\n%s\n' "$required" "$chosen_sdk" | sort -V | tail -n 1)" = "$required" ]; then
-            echo "::error::Best available iOS SDK is $chosen_sdk but the project needs $required."
+          if [ -n "$needed_major" ] && [ "${chosen_sdk%%.*}" -lt "$needed_major" ]; then
+            echo "::error::Best available iOS SDK is $chosen_sdk but the sources need an SDK >= $needed_major."
             exit 1
           fi
           echo "Selected $chosen with iOS SDK $chosen_sdk"
           {
             echo "DEVELOPER_DIR=$chosen"
             echo "IOS_SDK=$chosen_sdk"
-            echo "DEPLOY_TARGET=$required"
           } >> "$GITHUB_ENV"
 
       - name: Bootstrap native dependencies
@@ -94,19 +108,19 @@ jobs:
         run: |
           set -euo pipefail
           # The app target inherits $(RECOMMENDED_IPHONEOS_DEPLOYMENT_TARGET),
-          # which resolves to the SDK minimum outside of Xcode Cloud. Pin the
-          # deployment target the project declares at the project level.
+          # which resolves to the SDK minimum outside of Xcode Cloud, so pin the
+          # deployment target explicitly. It is overridden here (rather than
+          # edited in the project) so the project's 26.5 default is untouched.
           args="-project Pitchee.xcodeproj -scheme $SCHEME -configuration $CONFIGURATION -sdk iphoneos"
           args="$args -destination generic/platform=iOS -derivedDataPath build/DerivedData"
           args="$args CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="
           args="$args CODE_SIGN_ENTITLEMENTS= ENABLE_BITCODE=NO"
-          if [ -n "${DEPLOY_TARGET:-}" ]; then
-            args="$args IPHONEOS_DEPLOYMENT_TARGET=$DEPLOY_TARGET"
-          fi
+          args="$args ARCHS=arm64 ONLY_ACTIVE_ARCH=NO"
+          args="$args IPHONEOS_DEPLOYMENT_TARGET=$DEPLOY_TARGET"
           # shellcheck disable=SC2086
           if ! xcodebuild $args > build.log 2>&1; then
             echo '::error::xcodebuild failed'
-            grep -E 'error:|BUILD FAILED' build.log | head -n 60
+            grep -E 'error:|BUILD FAILED' build.log | head -n 80
             tail -n 200 build.log
             exit 1
           fi
@@ -121,15 +135,25 @@ jobs:
             echo "::error::Expected app bundle at $app"
             exit 1
           fi
+          # Fail loudly if the override did not take effect: a binary built for
+          # 26.5 dies with "Symbol not found ... built for iOS 26.5 which is
+          # newer than running OS" on older devices.
+          actual_min=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")
+          echo "Packaged MinimumOSVersion: $actual_min (requested $DEPLOY_TARGET)"
+          if [ "$actual_min" != "$DEPLOY_TARGET" ]; then
+            echo "::error::MinimumOSVersion is $actual_min but $DEPLOY_TARGET was requested."
+            exit 1
+          fi
           rm -rf build/Payload dist
           mkdir -p build/Payload dist
           cp -R "$app" build/Payload/Pitchee.app
           rm -rf build/Payload/Pitchee.app/_CodeSignature
-          ( cd build && zip -qry "../dist/Pitchee-${version}-${CONFIGURATION}-unsigned.ipa" Payload )
+          ( cd build && zip -qry "../dist/Pitchee-${version}-${CONFIGURATION}-ios${actual_min}-unsigned.ipa" Payload )
           ls -lh dist
           {
             echo "VERSION=$version"
-            echo "IPA_NAME=Pitchee-${version}-${CONFIGURATION}-unsigned.ipa"
+            echo "MIN_IOS=$actual_min"
+            echo "IPA_NAME=Pitchee-${version}-${CONFIGURATION}-ios${actual_min}-unsigned.ipa"
           } >> "$GITHUB_ENV"
 
       - name: Publish the IPA as a release asset
@@ -139,12 +163,13 @@ jobs:
           set -euo pipefail
           tag="ipa-build-${GITHUB_RUN_NUMBER}"
           gh release create "$tag" "dist/$IPA_NAME" \
-            --title "Pitchee ${VERSION} (${CONFIGURATION}) unsigned IPA" \
-            --notes "Unsigned device build from commit ${GITHUB_SHA}. Re-sign with your own certificate before installing (AltStore, Sideloadly, or Xcode)."
+            --title "Pitchee ${VERSION} (${CONFIGURATION}) unsigned IPA - iOS ${MIN_IOS}+" \
+            --notes "Unsigned device build from commit ${GITHUB_SHA}. Minimum iOS ${MIN_IOS}. Re-sign with your own certificate before installing (AltStore, Sideloadly, or Xcode)."
           {
             echo '### Unsigned IPA'
             echo ''
             echo "- File: \`$IPA_NAME\`"
+            echo "- Minimum iOS: ${MIN_IOS}"
             echo "- Download: https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag/$IPA_NAME"
             echo '- Install: re-sign with your own Apple ID (AltStore / Sideloadly) or through Xcode.'
           } >> "$GITHUB_STEP_SUMMARY"
